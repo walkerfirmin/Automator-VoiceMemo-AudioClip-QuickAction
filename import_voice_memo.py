@@ -348,6 +348,25 @@ def ffmpeg_has_aac_at() -> bool:
     return cp.returncode == 0 and "aac_at" in (cp.stdout or "")
 
 
+def ffprobe_channels(path: Path) -> int | None:
+    """Return the number of audio channels in path, or None on error."""
+    try:
+        cp = subprocess.run(
+            [
+                "ffprobe", "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=channels",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        s = (cp.stdout or "").strip()
+        return int(s) if s else None
+    except Exception:
+        return None
+
+
 def reencode_m4a(
     src: Path, dst: Path, *, dry_run: bool
 ) -> None:
@@ -359,6 +378,8 @@ def reencode_m4a(
         str(src),
         "-c:a",
         encoder,
+        "-ac",
+        "2",
         "-b:a",
         "128k",
         "-movflags",
@@ -463,9 +484,16 @@ def clone_latest_recording_row(
 ) -> tuple[dict[str, object | None], list[str]]:
     colinfo = load_table_columns(conn, "ZCLOUDRECORDING")
     names = [c["name"] for c in colinfo]
+    # Prefer a non-trashed row (ZEVICTIONDATE IS NULL) as the template so we do not
+    # inherit a trash/eviction date or deleted ZFLAGS bits from a deleted memo.
     row = conn.execute(
-        "SELECT * FROM ZCLOUDRECORDING ORDER BY Z_PK DESC LIMIT 1"
+        "SELECT * FROM ZCLOUDRECORDING WHERE ZEVICTIONDATE IS NULL ORDER BY Z_PK DESC LIMIT 1"
     ).fetchone()
+    if row is None:
+        # Fall back to any row if all are evicted.
+        row = conn.execute(
+            "SELECT * FROM ZCLOUDRECORDING ORDER BY Z_PK DESC LIMIT 1"
+        ).fetchone()
     if not row:
         raise SystemExit(
             "No existing rows in ZCLOUDRECORDING. Create at least one memo in Voice Memos "
@@ -494,10 +522,22 @@ def apply_new_recording_fields(
     out["ZDATE"] = zdate_core
     out["Z_OPT"] = 1
 
+    # Clear the eviction date so the memo is not immediately placed in Recently Deleted.
+    if "ZEVICTIONDATE" in out:
+        out["ZEVICTIONDATE"] = None
+
+    # Clear the "deleted/trashed" bit (0x100 = 256) from ZFLAGS so Voice Memos does not
+    # treat the new row as already deleted.
+    _ZFLAGS_DELETED_BIT = 0x100
+    if "ZFLAGS" in out and out["ZFLAGS"] is not None:
+        out["ZFLAGS"] = int(out["ZFLAGS"]) & ~_ZFLAGS_DELETED_BIT
+
     if "ZCUSTOMLABEL" in out:
         out["ZCUSTOMLABEL"] = label
     if "ZENCRYPTEDTITLE" in out:
         out["ZENCRYPTEDTITLE"] = label
+    if "ZCUSTOMLABELFORSORTING" in out:
+        out["ZCUSTOMLABELFORSORTING"] = label
 
     new_u = uuid.uuid4()
     for key in list(out.keys()):
@@ -745,6 +785,16 @@ def run_import_path(
     duration = ffprobe_duration(src, dry_run=args.dry_run)
     print(f"Duration (s): {duration:.3f}", flush=True)
 
+    if not args.dry_run and not args.re_encode:
+        ch = ffprobe_channels(src)
+        if ch is not None and ch > 2:
+            print(
+                f"Warning: source has {ch} audio channels; Voice Memos only supports "
+                "mono/stereo. Use --re-encode to downmix to stereo.",
+                file=sys.stderr,
+                flush=True,
+            )
+
     if args.dry_run:
         print("\nDry run: no files or database will be modified.")
 
@@ -853,10 +903,13 @@ def run_import_path(
         conn.close()
 
     print(f"Inserted ZCLOUDRECORDING Z_PK={new_pk} ZPATH={basename!r}", flush=True)
-    print(
-        "Open Voice Memos and test playback. If it fails, try again with --re-encode.",
-        flush=True,
-    )
+    if args.re_encode:
+        print("Open Voice Memos and test playback.", flush=True)
+    else:
+        print(
+            "Open Voice Memos and test playback. If it fails, try again with --re-encode.",
+            flush=True,
+        )
 
 
 def main() -> None:
@@ -948,3 +1001,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+˝
